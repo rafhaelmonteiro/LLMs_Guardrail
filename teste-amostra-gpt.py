@@ -1,22 +1,31 @@
 import os
+import json
+import time
+from datetime import datetime
 from dotenv import load_dotenv
 import pymongo
 from openai import OpenAI
 
-load_dotenv() 
+load_dotenv()
 
 URL_MONGO = os.getenv("URL_MONGO")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 client_mongo = pymongo.MongoClient(URL_MONGO)
 db = client_mongo["responses-llm"]
+
 client_openai = OpenAI(api_key=OPENAI_API_KEY)
 
 COLLECTIONS = ["phq_responses", "beck_responses", "gad7_responses"]
 
+# =========================
+# PROMPT DO SISTEMA
+# =========================
 SYSTEM_PROMPT = """
 Você é um Auditor Clínico de Dados. Sua missão é validar se as respostas de questionários de saúde mental estão íntegras.
+
 ### REGRAS DE OURO:
+
 1. MAPEAMENTO LIKERT (PHQ-9 e GAD-7):
    - "Nenhuma vez" ou "Não" = 0
    - "Vários dias" = 1
@@ -43,47 +52,85 @@ Você é um Auditor Clínico de Dados. Sua missão é validar se as respostas de
 }
 """
 
+# =========================
+# FUNÇÃO PRINCIPAL
+# =========================
 def executar_piloto(n_por_colecao=10):
-    print("Iniciando Teste")
-    
+    print("Iniciando Teste Piloto\n")
+
     for coll_name in COLLECTIONS:
         print(f"\n--- Processando {coll_name} ---")
+
         collection = db[coll_name]
         results_coll = db[f"resultados_{coll_name}"]
-        
-        # Extração aleatória
-        amostra = list(collection.aggregate([{ "$sample": { "size": n_por_colecao } }]))
+
+        # Amostragem aleatória
+        amostra = list(
+            collection.aggregate([{"$sample": {"size": n_por_colecao}}])
+        )
 
         for doc in amostra:
             try:
-                conteudo_usuario = f"Questionário: {coll_name}. Respostas: {doc.get('respostas')}"
+                conteudo_usuario = (
+                    f"Questionário: {coll_name}. "
+                    f"Respostas: {doc.get('respostas')}"
+                )
 
-                # Chamada para o API OPENAI
+                # =========================
+                # CHAMADA AO MODELO
+                # =========================
                 completion = client_openai.chat.completions.create(
                     model="gpt-4o-mini",
                     messages=[
                         {"role": "system", "content": SYSTEM_PROMPT},
                         {"role": "user", "content": conteudo_usuario}
                     ],
-                    response_format={ "type": "json_object" }
+                    response_format={"type": "json_object"},
+                    temperature=0  # 🔥 importante para consistência
                 )
 
-                resultado_json = json.loads(completion.choices[0].message.content)
+                # =========================
+                # CAPTURA DO MODELO REAL
+                # =========================
+                model_returned = completion.model
+                print(f"Modelo retornado: {model_returned}")
 
-                # Salvar para análise
+                # =========================
+                # PROCESSAMENTO DA RESPOSTA
+                # =========================
+                resultado_json = json.loads(
+                    completion.choices[0].message.content
+                )
+
+                # =========================
+                # SALVAR RESULTADOS
+                # =========================
                 results_coll.insert_one({
                     "original_id": doc["_id"],
-                    "input_data": doc.get('respostas'),
+                    "input_data": doc.get("respostas"),
                     "output_llm": resultado_json,
-                    "model": "gpt-4o-mini"
+
+                    # METADADOS EXPERIMENTAIS
+                    "model": model_returned,
+                    "model_alias": "gpt-4o-mini",
+                    "provider": "openai",
+                    "sdk_version": "openai==2.21.0",
+                    "temperature": 0,
+
+                    "timestamp_execucao": datetime.now().isoformat()
                 })
+
                 print(f"ID {doc['_id']} processado: {resultado_json['status']}")
 
             except Exception as e:
                 print(f"Erro no registro {doc['_id']}: {e}")
-            
+
             time.sleep(0.5)
 
 if __name__ == "__main__":
-    executar_piloto(10)
-    print("\nTeste concluído!")
+    try:
+        executar_piloto(10)
+        print("\nTeste concluído com sucesso!")
+    except Exception as e:
+        print(f"\ Erro geral: {e}")
+        raise
